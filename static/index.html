@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Minimal Voice Chat</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #f0f0f0; }
+        h1 { color: #333; }
+        #status { font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1><s>Minimal</s> WebSocket Voice Chat</h1>
+    <p>Status: <span id="status">Connecting...</span></p>
+    <button id="startButton">Start Chat</button>
+
+    <script>
+const statusEl = document.getElementById('status');
+const startButton = document.getElementById('startButton');
+
+// WebSocket variables
+let ws;
+let running = false;
+
+// WASM variables
+let wasmMemory;
+let wasmModule = null;
+let encode_audio = null;
+let decode_audio = null;
+let resample_f32 = null;
+
+// Audio variables
+const TARGET_SAMPLE_RATE = 16000;
+let audioCtx;
+let processor;
+let source;
+let workletPort;
+
+async function initWasm() {
+    try {
+        const response = await fetch('audio.wasm');
+        const bytes = await response.arrayBuffer();
+        const module = await WebAssembly.instantiate(bytes, {});
+
+        wasmModule = module.instance;
+        const exports = wasmModule.exports;
+        wasmMemory = exports.memory;
+        encode_audio = exports.encode_audio;
+        decode_audio = exports.decode_audio;
+        resample_f32 = exports.resample_f32;
+
+        console.log("WASM module loaded successfully.");
+
+    } catch (e) {
+        console.error("Failed to load WASM module:", e);
+        statusEl.textContent = "Error loading WASM module.";
+        statusEl.style.color = "red";
+    }
+}
+
+initWasm();
+// Wrapped in a function to reconnect using setTimeout
+function wsConnect() {
+    ws = new WebSocket("wss://"+window.location.host+"/vc/socket");
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+        if(!running) {
+            statusEl.textContent = "Connected. Click 'Start Chat' to begin.";
+            statusEl.style.color = "blue";
+            startButton.disabled = false;
+        } else {
+            statusEl.textContent = "Reconnected, running.";
+            statusEl.style.color = "green";
+            startButton.disabled = true;
+        }
+    };
+
+    ws.onclose = () => {
+        statusEl.textContent = "Disconnected from server. Attempting to reconnect";
+        statusEl.style.color = "red";
+        startButton.disabled = true;
+        setTimeout(function() {
+          wsConnect();
+        }, 1000);
+    };
+
+    ws.onerror = (err) => {
+        console.error("WebSocket Error:", err);
+        statusEl.textContent = "Connection error. (Is the server running?)";
+        statusEl.style.color = "red";
+    };
+
+    ws.onmessage = (event) => {
+        if (!decode_audio || !workletPort) {
+            return;
+        }
+        // The event.data is the received ArrayBuffer (encoded int8_t data)
+        const receivedBuffer = event.data;
+        const clientId = new Uint8Array(receivedBuffer)[0];
+        const encodedAudioData = new Uint8Array(receivedBuffer, 1);
+        const dataLength = encodedAudioData.length;
+
+        // Allocate memory for input (int8) and output (float) in WASM memory
+        const inputPtr = wasmModule.exports.__heap_base || 0x100000;
+        let currentPtr = inputPtr;
+
+        const decodeInputPtr = currentPtr;
+        currentPtr += dataLength;
+
+        const decodeOutputPtr = currentPtr;
+        currentPtr += encodedAudioData.byteLength * Float32Array.BYTES_PER_ELEMENT;
+        currentPtr += Float32Array.BYTES_PER_ELEMENT - currentPtr % Float32Array.BYTES_PER_ELEMENT; // Allign to 4 bytes
+
+        const resampleOutputSize = resample_f32(decodeOutputPtr, 0, TARGET_SAMPLE_RATE, audioCtx.sampleRate, dataLength);
+        const resampleOutputFloatPtr = currentPtr;
+        currentPtr += resampleOutputSize * Float32Array.BYTES_PER_ELEMENT;
+
+        // Ensure we have enough memory
+        const neededMemory = currentPtr;
+        const pagesNeeded = Math.ceil(neededMemory / 65536);
+        const currentPages = wasmMemory.buffer.byteLength / 65536;
+
+        if (pagesNeeded > currentPages) {
+            wasmMemory.grow(pagesNeeded - currentPages);
+        }
+
+        // Copy encoded data to WASM memory
+        const wasmInputArray = new Int8Array(wasmMemory.buffer, decodeInputPtr, dataLength);
+        wasmInputArray.set(encodedAudioData);
+
+        decode_audio(decodeInputPtr, decodeOutputPtr, dataLength);
+
+        resample_f32(decodeOutputPtr, resampleOutputFloatPtr, TARGET_SAMPLE_RATE, audioCtx.sampleRate, dataLength);
+
+        const floatData = new Float32Array(wasmMemory.buffer, resampleOutputFloatPtr, resampleOutputSize);
+        workletPort.postMessage({channel: clientId, data: floatData});
+    };
+}
+wsConnect();
+
+startButton.disabled = true;
+startButton.onclick = async () => {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (!encode_audio || !resample_f32) {
+        statusEl.textContent = "WASM functions not loaded yet. Please wait.";
+        statusEl.style.color = "orange";
+        return;
+    }
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        statusEl.textContent = `Microphone access granted: ${audioCtx.sampleRate} Hz`;
+        statusEl.style.color = "green";
+        startButton.disabled = true;
+        running = true;
+
+        source = audioCtx.createMediaStreamSource(stream);
+        await audioCtx.audioWorklet.addModule("audio-processor.js");
+        const processor = new AudioWorkletNode(
+          audioCtx,
+          "audio-mixer-processor",
+        );
+        workletPort = processor.port;
+
+        workletPort.onmessage = (e) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                const inputData = e.data;
+                // Allocate memory for input (float) and output (int8) in WASM memory
+                const inputPtr = wasmModule.exports.__heap_base || 0x100000;
+                let currentPtr = inputPtr;
+
+                const inputFloatPtr = currentPtr;
+                currentPtr += inputData.length * Float32Array.BYTES_PER_ELEMENT;
+
+                const resampleOutputSize = resample_f32(inputFloatPtr, 0, audioCtx.sampleRate, TARGET_SAMPLE_RATE, inputData.length);
+                const resampleOutputFloatPtr = currentPtr;
+                currentPtr += resampleOutputSize * Float32Array.BYTES_PER_ELEMENT;
+
+                const encodeOutputPtr = currentPtr;
+                currentPtr += resampleOutputSize;
+
+                // Ensure we have enough memory
+                const neededMemory = currentPtr;
+                const pagesNeeded = Math.ceil(neededMemory / 65536);
+                const currentPages = wasmMemory.buffer.byteLength / 65536;
+
+                if (pagesNeeded > currentPages) {
+                    wasmMemory.grow(pagesNeeded - currentPages);
+                }
+
+                // Copy input data to WASM memory
+                const wasmInputArray = new Float32Array(wasmMemory.buffer, inputFloatPtr, inputData.length);
+                wasmInputArray.set(inputData);
+
+                resample_f32(inputFloatPtr, resampleOutputFloatPtr, audioCtx.sampleRate, TARGET_SAMPLE_RATE, inputData.length);
+
+                encode_audio(resampleOutputFloatPtr, encodeOutputPtr, resampleOutputSize);
+
+                // Get encoded data from WASM memory
+                const encodedData = new Int8Array(wasmMemory.buffer, encodeOutputPtr, resampleOutputSize);
+
+                // Send encoded data
+                ws.send(encodedData);
+            }
+        };
+
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+    } catch (err) {
+        statusEl.textContent = "Error accessing the microphone: " + err;
+        statusEl.style.color = "red";
+    }
+};
+    </script>
+</body>
+</html>
